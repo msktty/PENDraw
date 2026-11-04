@@ -109,6 +109,14 @@
     padding-top: 6px;
     margin-top: 2px;
   }
+  .project-status {
+    color: #a1a1aa;
+    font-size: 10px;
+    width: 100%;
+    text-align: right;
+    padding: 0 5px;
+  }
+  .project-status.dirty { color: #fbbf24; }
 
   .top-btn {
     background: transparent;
@@ -338,6 +346,13 @@
     outline: none;
   }
   .modal-textarea:focus { border-color: #00ff66; }
+  .text-edit-hint {
+    color: #a1a1aa;
+    font-size: 11px;
+    line-height: 1.5;
+    margin: -5px 0 12px;
+    text-align: left;
+  }
   .font-selector-wrapper {
     display: flex;
     gap: 4px;
@@ -529,8 +544,11 @@
     <button class="top-btn" id="btnAdd">➕ 追加</button>
     <button class="top-btn" id="btnEdit">✏️ 編集</button> 
     <button class="top-btn" id="btnView">👁️ 表示</button>
+    <button class="top-btn" id="btnFileMenu">📁 ファイル</button>
     <button class="top-btn" id="btnExport">📤 出力</button>
+    <input type="file" id="projectFileInput" accept=".pendproj,application/json" hidden>
   </div>
+  <div class="project-status" id="projectStatus">未保存の新規プロジェクト</div>
   <div class="top-bar-section bottom-section">
     <button class="top-btn layer-toggle-btn" id="btnLayerShortcut">🎨 レイヤー</button>
     <button class="top-btn" id="btnUndoShortcut">↩️ Undo</button>
@@ -596,6 +614,7 @@
   <div class="modal-card">
     <div class="modal-title" id="textModalTitle">テキスト入力</div>
     <textarea id="modalTextarea" class="modal-textarea" placeholder="ここに文字を入力してください"></textarea>
+    <div class="text-edit-hint">配置後は、キャンバス上の文字をダブルクリックして直接編集できます。</div>
     
     <div class="font-selector-wrapper">
       <button class="font-btn active" data-font="sans-serif" style="font-family:sans-serif;">ゴシック</button>
@@ -684,6 +703,8 @@
   const bgCtx = bgCanvas.getContext('2d');
 
   let fabricCanvas = null;
+  // ツール切替で一時的に選択が外れても、文字色の適用先を保持する
+  let lastColorTextTarget = null;
   let paintLayers = [];
   let activePaintLayerIndex = 0;
   let bgImageElement = null;
@@ -707,6 +728,17 @@
   let globalHistory = [];
   let globalHistoryIndex = -1;
   let isApplyingHistory = false;
+
+  // PROJECT SAVE / RECOVERY
+  const PROJECT_FORMAT = 'PENDRAW_PROJECT';
+  const PROJECT_VERSION = 1;
+  let projectId = generateUUID();
+  let projectName = '名称未設定';
+  let projectFileHandle = null;
+  let lastProjectFileSnapshot = null;
+  let autosaveTimer = null;
+  let isProjectDirty = false;
+  let isRestoringProject = false;
 
   let isEditingText = false;
   let currentEditingTargetObject = null;
@@ -738,6 +770,44 @@
     const z = Math.max(0.08, viewportZoom || 1);
     // 旧デフォルトより一回り大きい程度。画面上では約18pxに保つ
     return Math.max(12, Math.min(220, 18 / z));
+  }
+
+  function isTextObject(obj) {
+    return !!obj && (obj.type === 'text' || obj.type === 'i-text' || obj.type === 'textbox');
+  }
+
+  // 旧バージョンで保存された fabric.Text は直接編集できないため、
+  // 読み込み時に同じ属性を引き継いだ fabric.IText に置き換える。
+  function upgradeTextObjectsForEditing() {
+    if (!fabricCanvas) return;
+    const objects = fabricCanvas.getObjects().slice();
+    objects.forEach((obj) => {
+      if (obj && obj.type === 'text' && fabric.IText) {
+        const index = fabricCanvas.getObjects().indexOf(obj);
+        const options = obj.toObject(['uuid', 'locked', 'name', 'shadow']);
+        const editable = new fabric.IText(obj.text || '', options);
+        editable.uuid = obj.uuid || generateUUID();
+        fabricCanvas.remove(obj);
+        fabricCanvas.insertAt(editable, index, false);
+        applySelectableProps(editable);
+      } else if (isTextObject(obj)) {
+        applySelectableProps(obj);
+      }
+    });
+    fabricCanvas.requestRenderAll();
+  }
+
+  function beginCanvasTextEditing(obj) {
+    if (!isTextObject(obj) || typeof obj.enterEditing !== 'function') return;
+    if (currentTool !== 'select' && currentTool !== 'text') setTool('select');
+    fabricCanvas.setActiveObject(obj);
+    if (typeof obj.enterEditing === 'function') obj.enterEditing();
+    if (obj.hiddenTextarea) {
+      obj.hiddenTextarea.focus();
+      obj.hiddenTextarea.setSelectionRange(obj.text.length, obj.text.length);
+    }
+    document.getElementById('textObjectHud').classList.add('hidden');
+    fabricCanvas.requestRenderAll();
   }
 
   function applySelectableProps(obj) {
@@ -776,6 +846,219 @@
     applyViewportTransform();
   }
 
+  // ======================== PROJECT SAVE / LOAD / AUTOSAVE ========================
+  function updateProjectStatus() {
+    const el = document.getElementById('projectStatus');
+    if (!el) return;
+    el.textContent = `${projectName}${isProjectDirty ? ' ・未保存の変更あり' : ' ・保存済み'}`;
+    el.classList.toggle('dirty', isProjectDirty);
+  }
+
+  function setProjectDirty(snapshot) {
+    if (isRestoringProject) return;
+    isProjectDirty = snapshot !== lastProjectFileSnapshot;
+    updateProjectStatus();
+    scheduleProjectAutosave(snapshot);
+  }
+
+  function openRecoveryDB() {
+    return new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) return reject(new Error('IndexedDB非対応'));
+      const req = indexedDB.open('PENDrawRecoveryDB', 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('projects')) db.createObjectStore('projects', { keyPath: 'projectId' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('IndexedDBを開けません'));
+    });
+  }
+
+  async function writeRecoveryRecord(snapshot) {
+    const db = await openRecoveryDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('projects', 'readwrite');
+      tx.objectStore('projects').put({
+        projectId, projectName, snapshot,
+        updatedAt: new Date().toISOString(),
+        projectFileSnapshot: lastProjectFileSnapshot
+      });
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); reject(tx.error || new Error('自動保存に失敗しました')); };
+      tx.onabort = () => { db.close(); reject(tx.error || new Error('自動保存が中断されました')); };
+    });
+  }
+
+  async function readRecoveryRecord() {
+    const db = await openRecoveryDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('projects', 'readonly');
+      const req = tx.objectStore('projects').get(projectId);
+      req.onsuccess = () => { const value = req.result || null; db.close(); resolve(value); };
+      req.onerror = () => { db.close(); reject(req.error); };
+    });
+  }
+
+  async function readLatestRecoveryRecord() {
+    const db = await openRecoveryDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('projects', 'readonly');
+      const req = tx.objectStore('projects').getAll();
+      req.onsuccess = () => {
+        const items = req.result || [];
+        db.close();
+        items.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+        resolve(items[0] || null);
+      };
+      req.onerror = () => { db.close(); reject(req.error); };
+    });
+  }
+
+  function scheduleProjectAutosave(snapshot) {
+    if (isRestoringProject) return;
+    clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(async () => {
+      try {
+        await writeRecoveryRecord(snapshot);
+        showStatus('自動バックアップ済み');
+      } catch (err) {
+        console.warn('PENDraw autosave failed:', err);
+        showStatus('自動バックアップに失敗しました');
+      }
+    }, 900);
+  }
+
+  function getCurrentProjectState() {
+    if (globalHistoryIndex >= 0 && globalHistory[globalHistoryIndex]) {
+      return JSON.parse(globalHistory[globalHistoryIndex]);
+    }
+    return {
+      canvasWidth: CANVAS_W, canvasHeight: CANVAS_H, activeIdx: activePaintLayerIndex,
+      layers: [], fabricJSON: fabricCanvas ? JSON.stringify(fabricCanvas.toJSON(['uuid','locked','name','shadow'])) : null,
+      bgVisible, bgImageDataUrl
+    };
+  }
+
+  function downloadProjectBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  async function saveProjectFile(forceSaveAs = false) {
+    const snapshot = globalHistory[globalHistoryIndex] || JSON.stringify(getCurrentProjectState());
+    const project = {
+      format: PROJECT_FORMAT,
+      version: PROJECT_VERSION,
+      projectId,
+      name: projectName,
+      savedAt: new Date().toISOString(),
+      state: JSON.parse(snapshot)
+    };
+    const blob = new Blob([JSON.stringify(project)], { type: 'application/vnd.pendraw.project+json' });
+    const safeName = (projectName || '名称未設定').replace(/[\\/:*?"<>|]/g, '_');
+    const filename = safeName.endsWith('.pendproj') ? safeName : safeName + '.pendproj';
+
+    try {
+      if ('showSaveFilePicker' in window) {
+        if (!projectFileHandle || forceSaveAs) {
+          projectFileHandle = await window.showSaveFilePicker({
+            suggestedName: filename,
+            types: [{ description: 'PENDrawプロジェクト', accept: { 'application/vnd.pendraw.project+json': ['.pendproj'] } }]
+          });
+        }
+        const writable = await projectFileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } else {
+        downloadProjectBlob(blob, filename);
+      }
+      lastProjectFileSnapshot = snapshot;
+      isProjectDirty = false;
+      updateProjectStatus();
+      try { await writeRecoveryRecord(snapshot); } catch (e) { console.warn(e); }
+      showStatus('プロジェクトを保存しました');
+      return true;
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        showStatus('保存をキャンセルしました');
+        return false;
+      }
+      console.error(err);
+      showStatus('保存に失敗しました');
+      alert('プロジェクトを保存できませんでした。保存先の空き容量やアクセス権を確認してください。');
+      return false;
+    }
+  }
+
+  function restoreProjectState(state) {
+    if (!state || !Array.isArray(state.layers) || !state.canvasWidth || !state.canvasHeight) {
+      throw new Error('プロジェクトデータの構造が正しくありません');
+    }
+    isRestoringProject = true;
+    globalHistory = [JSON.stringify(state)];
+    globalHistoryIndex = 0;
+    applySystemStateFromHistory();
+    setTimeout(() => {
+      isRestoringProject = false;
+      const snapshot = globalHistory[globalHistoryIndex];
+      lastProjectFileSnapshot = snapshot;
+      isProjectDirty = false;
+      updateProjectStatus();
+      fitToScreen();
+    }, 250);
+  }
+
+  async function openProjectFile(file) {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const project = JSON.parse(text);
+      if (project.format !== PROJECT_FORMAT || !project.state) throw new Error('PENDrawプロジェクトではありません');
+      if (project.version > PROJECT_VERSION) throw new Error('このプロジェクトは新しいバージョンのPENDrawで作成されています');
+      if (isProjectDirty && !confirm('現在のプロジェクトに未保存の変更があります。開くと現在の作業内容が置き換わります。続行しますか？')) return;
+      projectId = project.projectId || generateUUID();
+      projectName = project.name || file.name.replace(/\\.pendproj$/i, '');
+      projectFileHandle = null;
+      restoreProjectState(project.state);
+      showStatus('プロジェクトを開きました');
+    } catch (err) {
+      console.error(err);
+      alert('プロジェクトを開けませんでした。ファイル形式またはデータが破損している可能性があります。\\n' + err.message);
+    }
+  }
+
+  async function offerRecoveryOnStartup() {
+    try {
+      const record = await readLatestRecoveryRecord();
+      if (!record || !record.snapshot) return;
+      const age = Date.now() - new Date(record.updatedAt).getTime();
+      if (!Number.isFinite(age) || age > 30 * 24 * 60 * 60 * 1000) return;
+      if (confirm(`前回の作業バックアップがあります。\\n\\nプロジェクト：${record.projectName || '名称未設定'}\\n最終バックアップ：${new Date(record.updatedAt).toLocaleString()}\\n\\n復元しますか？`)) {
+        const state = JSON.parse(record.snapshot);
+        projectId = record.projectId || generateUUID();
+        projectName = record.projectName || '復元プロジェクト';
+        projectFileHandle = null;
+        restoreProjectState(state);
+        lastProjectFileSnapshot = record.projectFileSnapshot || null;
+        isProjectDirty = record.snapshot !== lastProjectFileSnapshot;
+        updateProjectStatus();
+        showStatus('前回の作業を復元しました');
+      }
+    } catch (err) {
+      console.warn('Recovery check failed:', err);
+    }
+  }
+
+  // Browser-native warning for closing/reloading a tab with unsaved project-file changes.
+  window.addEventListener('beforeunload', (event) => {
+    if (!isProjectDirty) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+
   // ======================== INTEGRATED GLOBAL HISTORY ENGINE ========================
   function commitSystemState() {
     if (isApplyingHistory) return;
@@ -799,12 +1082,14 @@
     globalHistory.push(snapshot);
     if (globalHistory.length > 20) globalHistory.shift();
     globalHistoryIndex = globalHistory.length - 1;
+    setProjectDirty(snapshot);
   }
 
   function performUndo() {
     if (globalHistoryIndex > 0) {
       globalHistoryIndex--;
       applySystemStateFromHistory();
+      setProjectDirty(globalHistory[globalHistoryIndex]);
       showStatus('元に戻す (Undo)');
     } else {
       showStatus('これ以上戻せません');
@@ -815,6 +1100,7 @@
     if (globalHistoryIndex < globalHistory.length - 1) {
       globalHistoryIndex++;
       applySystemStateFromHistory();
+      setProjectDirty(globalHistory[globalHistoryIndex]);
       showStatus('やり直し (Redo)');
     } else {
       showStatus('最新の状態です');
@@ -880,6 +1166,7 @@
           renderAllPaintLayers();
           if (fabricCanvas && state.fabricJSON) {
             fabricCanvas.loadFromJSON(JSON.parse(state.fabricJSON), () => {
+              upgradeTextObjectsForEditing();
               fabricCanvas.getObjects().forEach(obj => {
                 applySelectableProps(obj);
               });
@@ -1014,63 +1301,77 @@
   }
 
   // ① スポイトツール修正：勝手なツール切り替え「setTool('select');」を完全に排除
+  // スポイト：画面の重なり順（Fabric → ペイント → 背景）で最前面の色を取得
   function executeEyedropper(x, y) {
     x = Math.floor(x); y = Math.floor(y);
-    if(x<0 || x>=CANVAS_W || y<0 || y>=CANVAS_H) return;
-    
-    for (let i = paintLayers.length - 1; i >= 0; i--) {
-      const l = paintLayers[i];
-      if (l.visible) {
-        try {
-          const pData = l.ctx.getImageData(x, y, 1, 1).data;
-          if (pData[3] > 5) {
-            let hex = "#" + ((1 << 24) + (pData[0] << 16) + (pData[1] << 8) + pData[2]).toString(16).slice(1);
-            updateSystemColor(hex);
-            showStatus(`色を取得 (レイヤー層): ${hex}`);
-            return; 
+    if (x < 0 || x >= CANVAS_W || y < 0 || y >= CANVAS_H) return;
+
+    // Fabricオブジェクトはペイントレイヤーより前面に表示される
+    if (fabricCanvas) {
+      try {
+        const fabObjects = fabricCanvas.getObjects();
+        for (let i = fabObjects.length - 1; i >= 0; i--) {
+          const obj = fabObjects[i];
+          if (!obj.visible || !obj.containsPoint(new fabric.Point(x, y))) continue;
+          const col = obj.fill || obj.stroke;
+          if (col && typeof col === 'string' && /^#[0-9a-f]{6}$/i.test(col)) {
+            updateSystemColor(col);
+            showStatus(`色を取得 (オブジェクト層): ${col}`);
+            return;
           }
-        } catch(e){}
-      }
+        }
+      } catch (e) {}
     }
+
+    // ペイントレイヤーは上から下へ確認。透明度0のレイヤーは対象外
+    for (let i = paintLayers.length - 1; i >= 0; i--) {
+      const layer = paintLayers[i];
+      if (!layer.visible || layer.opacity <= 0) continue;
+      try {
+        const pixel = layer.ctx.getImageData(x, y, 1, 1).data;
+        if (pixel[3] * layer.opacity > 5) {
+          const hex = "#" + ((1 << 24) + (pixel[0] << 16) + (pixel[1] << 8) + pixel[2]).toString(16).slice(1);
+          updateSystemColor(hex);
+          showStatus(`色を取得 (レイヤー層): ${hex}`);
+          return;
+        }
+      } catch (e) {}
+    }
+
+    // 背景は最背面
     try {
-      const bgData = bgCtx.getImageData(x, y, 1, 1).data;
-      if (bgData[3] >= 10) {
-        let hex = "#" + ((1 << 24) + (bgData[0] << 16) + (bgData[1] << 8) + bgData[2]).toString(16).slice(1);
+      const pixel = bgCtx.getImageData(x, y, 1, 1).data;
+      if (pixel[3] >= 10) {
+        const hex = "#" + ((1 << 24) + (pixel[0] << 16) + (pixel[1] << 8) + pixel[2]).toString(16).slice(1);
         updateSystemColor(hex);
         showStatus(`色を取得 (背景層): ${hex}`);
         return;
       }
-    } catch(e){}
-    
-    if (fabricCanvas) {
-      try {
-        let fabObjects = fabricCanvas.getObjects();
-        for (let i = fabObjects.length - 1; i >= 0; i--) {
-          let obj = fabObjects[i];
-          if (obj.visible && obj.containsPoint(new fabric.Point(x, y))) {
-            let col = obj.fill || obj.stroke;
-            if (col && typeof col === 'string' && col.startsWith('#')) {
-              updateSystemColor(col);
-              showStatus(`色を取得 (オブジェクト層): ${col}`);
-              return;
-            }
-          }
-        }
-      } catch(e){}
-    }
+    } catch (e) {}
     showStatus("透明なピクセルです");
   }
 
   function updateSystemColor(hex) {
+    if (!hex || !/^#[0-9a-f]{6}$/i.test(hex)) return;
     brushColor = hex;
-    nativePicker.value = hex;
-    if(fabricCanvas && fabricCanvas.getActiveObject()) {
-      let act = fabricCanvas.getActiveObject();
-      if(act.type === 'text' || act.type === 'i-text') {
-        act.set('fill', hex);
-        fabricCanvas.renderAll();
-        commitSystemState();
-      }
+    if (nativePicker) nativePicker.value = hex;
+
+    // 現在の選択を優先。スポイトに切り替えた際に選択が外れた場合は
+    // 直前に選択していた文字オブジェクトへ適用する。
+    const active = fabricCanvas && fabricCanvas.getActiveObject
+      ? fabricCanvas.getActiveObject() : null;
+    const target = (active && isTextObject(active))
+      ? active
+      : (lastColorTextTarget && fabricCanvas &&
+         fabricCanvas.getObjects().includes(lastColorTextTarget)
+          ? lastColorTextTarget : null);
+
+    if (target) {
+      target.set('fill', hex);
+      if (typeof target.setCoords === 'function') target.setCoords();
+      fabricCanvas.requestRenderAll();
+      if (!isApplyingHistory) commitSystemState();
+      showStatus(`文字色を変更: ${hex}`);
     }
   }
 
@@ -1121,9 +1422,36 @@
     fabricCanvas.on('object:added', () => { if (!isApplyingHistory) commitSystemState(); });
     fabricCanvas.on('object:removed', () => { if (!isApplyingHistory) commitSystemState(); });
 
-    fabricCanvas.on('selection:created', (e) => { handleObjectSelection(e); });
-    fabricCanvas.on('selection:updated', (e) => { handleObjectSelection(e); });
-    fabricCanvas.on('selection:cleared', () => { document.getElementById('textObjectHud').classList.add('hidden'); });
+    // IText の編集終了を履歴・自動保存へ反映する
+    fabricCanvas.on('text:editing:exited', () => {
+      if (!isApplyingHistory) commitSystemState();
+      const active = fabricCanvas.getActiveObject();
+      if (active && isTextObject(active)) handleObjectSelection({ selected: [active] });
+    });
+
+    // テキストをキャンバス上でダブルクリックすると、その場で直接編集できる
+    fabricCanvas.on('mouse:dblclick', (options) => {
+      const target = options && options.target;
+      if (isTextObject(target)) {
+        beginCanvasTextEditing(target);
+      }
+    });
+
+    fabricCanvas.on('selection:created', (e) => {
+      const selected = (e && e.selected) || [];
+      const textTarget = selected.find(obj => isTextObject(obj));
+      if (textTarget) lastColorTextTarget = textTarget;
+      handleObjectSelection(e);
+    });
+    fabricCanvas.on('selection:updated', (e) => {
+      const selected = (e && e.selected) || [];
+      const textTarget = selected.find(obj => isTextObject(obj));
+      if (textTarget) lastColorTextTarget = textTarget;
+      handleObjectSelection(e);
+    });
+    fabricCanvas.on('selection:cleared', () => {
+      document.getElementById('textObjectHud').classList.add('hidden');
+    });
 
     // ⑧ 線ツールの描画開始・追従イベント処理
     fabricCanvas.on('mouse:down', (options) => {
@@ -1175,7 +1503,7 @@
     hud.classList.remove('hidden');
     
     // テキストオブジェクトのみ編集関連ボタンを表示する簡易制御
-    const isText = (obj.type === 'text' || obj.type === 'i-text');
+    const isText = isTextObject(obj);
     const currentScale = Math.max(Math.abs(obj.scaleX || 1), Math.abs(obj.scaleY || 1));
     document.getElementById('hudScaleInput').value = String(Math.round(currentScale * 100));
     document.getElementById('hudBtnEdit').style.display = isText ? 'inline-block' : 'none';
@@ -1436,7 +1764,7 @@
       item.className = 'layer-item' + (i === activePaintLayerIndex ? ' selected' : '');
       item.innerHTML = `
         <div class="layer-row">
-          <span class="layer-name" id="lblname-${l.id}">${l.name || 'レイヤー'}</span>
+          <span class="layer-name" id="lblname-${l.id}"></span>
           <div class="layer-actions">
             <button class="layer-act-btn ${!l.visible?'active':''}" id="vis-${l.id}">${l.visible?'👁️':'👁️‍🗨️'}</button>
             <button class="layer-act-btn ${l.locked?'active':''}" id="lock-${l.id}">${l.locked?'🔒':'🔓'}</button>
@@ -1446,6 +1774,8 @@
         <input type="range" class="opacity-slider" min="0" max="1" step="0.01" value="${l.opacity}" id="opac-${l.id}">
       `;
       list.appendChild(item);
+      // プロジェクトファイル由来のレイヤー名をHTMLとして解釈させない
+      item.querySelector(`#lblname-${l.id}`).textContent = l.name || 'レイヤー';
       
       item.querySelector(`#lblname-${l.id}`).onclick = () => {
         activePaintLayerIndex = i;
@@ -1472,11 +1802,16 @@
           if (l.canvas && l.canvas.parentNode) {
             l.canvas.parentNode.removeChild(l.canvas);
           }
-          paintLayers.splice(i, 1);
-          // active layer の自動安全調整
-          if (activePaintLayerIndex >= paintLayers.length) {
-            activePaintLayerIndex = paintLayers.length - 1;
+          const deletedIndex = i;
+          const previousActiveIndex = activePaintLayerIndex;
+          paintLayers.splice(deletedIndex, 1);
+          // 削除位置に応じて選択中レイヤーのindexを補正
+          if (deletedIndex < previousActiveIndex) {
+            activePaintLayerIndex = previousActiveIndex - 1;
+          } else if (deletedIndex === previousActiveIndex) {
+            activePaintLayerIndex = Math.min(deletedIndex, paintLayers.length - 1);
           }
+          activePaintLayerIndex = Math.max(0, Math.min(activePaintLayerIndex, paintLayers.length - 1));
           renderAllPaintLayers();
           refreshLayerPanel();
           commitSystemState();
@@ -1496,20 +1831,42 @@
       showStatus("これ以上下のレイヤーはありません");
       return;
     }
-    const topLayer = paintLayers[activePaintLayerIndex];
-    const bottomLayer = paintLayers[activePaintLayerIndex - 1];
-    
-    bottomLayer.ctx.save();
-    bottomLayer.ctx.globalAlpha = topLayer.opacity;
-    bottomLayer.ctx.drawImage(topLayer.canvas, 0, 0);
-    bottomLayer.ctx.restore();
-    
+    const topIndex = activePaintLayerIndex;
+    const topLayer = paintLayers[topIndex];
+    const bottomLayer = paintLayers[topIndex - 1];
+
+    // 2枚を透明な一時キャンバス上で、それぞれの表示状態・不透明度を反映して合成する。
+    // 合成結果を不透明度1の下レイヤーへ格納し、さらに下のレイヤーとの見た目を維持する。
+    const mergedCanvas = document.createElement('canvas');
+    mergedCanvas.width = CANVAS_W;
+    mergedCanvas.height = CANVAS_H;
+    const mergedCtx = mergedCanvas.getContext('2d');
+    if (!mergedCtx) {
+      showStatus("レイヤー結合用のキャンバスを作成できませんでした");
+      return;
+    }
+    if (bottomLayer.visible && bottomLayer.opacity > 0) {
+      mergedCtx.globalAlpha = bottomLayer.opacity;
+      mergedCtx.drawImage(bottomLayer.canvas, 0, 0);
+    }
+    if (topLayer.visible && topLayer.opacity > 0) {
+      mergedCtx.globalAlpha = topLayer.opacity;
+      mergedCtx.drawImage(topLayer.canvas, 0, 0);
+    }
+    mergedCtx.globalAlpha = 1;
+
+    bottomLayer.ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    bottomLayer.ctx.globalAlpha = 1;
+    bottomLayer.ctx.drawImage(mergedCanvas, 0, 0);
+    bottomLayer.opacity = 1;
+    bottomLayer.visible = bottomLayer.visible || topLayer.visible;
+
     if (topLayer.canvas && topLayer.canvas.parentNode) {
       topLayer.canvas.parentNode.removeChild(topLayer.canvas);
     }
-    paintLayers.splice(activePaintLayerIndex, 1);
-    activePaintLayerIndex--;
-    
+    paintLayers.splice(topIndex, 1);
+    activePaintLayerIndex = topIndex - 1;
+
     renderAllPaintLayers();
     refreshLayerPanel();
     commitSystemState();
@@ -1612,6 +1969,88 @@
     makePanelMovable('movableDpad', 'dpadHandle');
     makePanelMovable('bottomToolbarFloating', 'toolbarHandle');
     commitSystemState();
+    lastProjectFileSnapshot = globalHistory[globalHistoryIndex];
+    isProjectDirty = false;
+    updateProjectStatus();
+    offerRecoveryOnStartup();
+
+    // PROJECT FILE CONTROLS
+    function chooseImageFile(mode) {
+      const inp = document.createElement('input');
+      inp.type = 'file';
+      inp.accept = 'image/*';
+      inp.onchange = (ev) => {
+        const file = ev.target.files && ev.target.files[0];
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+          showStatus('画像ファイルを選択してください');
+          return;
+        }
+        const reader = new FileReader();
+        reader.onerror = () => showStatus('画像ファイルを読み込めませんでした');
+        reader.onload = (re) => {
+          if (mode === 'background') {
+            const img = new Image();
+            img.onload = () => {
+              bgImageElement = img;
+              bgImageDataUrl = re.target.result;
+              renderBackground();
+              commitSystemState();
+              showStatus('背景画像を読み込みました');
+            };
+            img.onerror = () => showStatus('背景画像を開けませんでした');
+            img.src = re.target.result;
+            return;
+          }
+          fabric.Image.fromURL(re.target.result, (fImg) => {
+            if (!fImg) { showStatus('画像を読み込めませんでした'); return; }
+            setTool('select');
+            const c = getCanvasCenterCoordinates();
+            fImg.set({ left: c.x - 100, top: c.y - 100 });
+            fImg.scaleToWidth(200);
+            applySelectableProps(fImg);
+            fabricCanvas.add(fImg);
+            fabricCanvas.setActiveObject(fImg);
+            fabricCanvas.requestRenderAll();
+            commitSystemState();
+            showStatus('画像ファイルを配置しました');
+          });
+        };
+        reader.readAsDataURL(file);
+      };
+      inp.click();
+    }
+
+    document.getElementById('btnFileMenu').onclick = (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      showSubmenu([
+        { label: '📂 プロジェクトを開く (.pendproj)', action: () => {
+            if (isProjectDirty && !confirm('未保存の変更があります。プロジェクトを開くと現在の作業が置き換わります。続行しますか？')) return;
+            document.getElementById('projectFileInput').click();
+        }},
+        { label: '💾 プロジェクトを保存', action: () => saveProjectFile(false) },
+        { label: '💾 名前を付けて保存', action: () => saveProjectFile(true) },
+        { label: '📝 プロジェクト名を変更', action: () => {
+            const nextName = prompt('プロジェクト名を入力してください', projectName);
+            if (nextName === null) return;
+            const cleaned = nextName.trim();
+            if (!cleaned) { alert('プロジェクト名を入力してください'); return; }
+            projectName = cleaned;
+            projectFileHandle = null;
+            isProjectDirty = true;
+            updateProjectStatus();
+            scheduleProjectAutosave(globalHistory[globalHistoryIndex] || JSON.stringify(getCurrentProjectState()));
+            showStatus('プロジェクト名を変更しました');
+        }},
+        { label: '🖼️ 画像ファイルを開く・配置', action: () => chooseImageFile('place') },
+        { label: '🌄 背景画像ファイルを開く', action: () => chooseImageFile('background') }
+      ], r.left, r.bottom + 8, 'btnFileMenu');
+    };
+    document.getElementById('projectFileInput').onchange = (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (file) openProjectFile(file);
+      e.target.value = '';
+    };
 
     // TOP BAR BINDS (📄新規, ➕追加, ✏️編集, 👁️表示, 📤出力)
     document.getElementById('btnNew').onclick = () => {
@@ -1668,6 +2107,7 @@
     updateCanvasPresetSelection('A4V', 'A4 縦 1600 × 2200');
 
     document.getElementById('confirmNewCanvas').onclick = () => {
+      if (isProjectDirty && !confirm('現在のプロジェクトに未保存の変更があります。新規作成すると作業内容が置き換わります。続行しますか？')) return;
       const w = parseInt(document.getElementById('customW').value, 10);
       const h = parseInt(document.getElementById('customH').value, 10);
       if (!Number.isFinite(w) || !Number.isFinite(h) || w < 1 || h < 1) {
@@ -1691,8 +2131,14 @@
       fitToScreen();
       document.getElementById('newCanvasModal').classList.remove('active');
       globalHistory = []; globalHistoryIndex = -1;
+      projectId = generateUUID();
+      projectName = '名称未設定';
+      projectFileHandle = null;
+      lastProjectFileSnapshot = null;
+      isProjectDirty = true;
       commitSystemState();
-      showStatus("キャンバスを再生成しました");
+      updateProjectStatus();
+      showStatus("新しいプロジェクトを作成しました");
     };
 
     // ➕ 追加サブメニュー（既存スタンプ機能の完全維持）
@@ -1924,7 +2370,7 @@
       } else {
         setTool('select');
         let c = getCanvasCenterCoordinates();
-        let fText = new fabric.Text(txt, {
+        let fText = new fabric.IText(txt, {
           left: c.x - 100,
           top: c.y - 30,
           fontFamily: modalSelectedFont,
@@ -1989,7 +2435,7 @@
     });
     document.getElementById('hudBtnEdit').onclick = () => {
       let act = fabricCanvas.getActiveObject();
-      if(!act || !(act.type==='text' || act.type==='i-text')) return;
+      if(!isTextObject(act)) return;
       isEditingText = true;
       currentEditingTargetObject = act;
       modalSelectedFont = act.fontFamily || 'sans-serif';
